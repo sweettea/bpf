@@ -4503,12 +4503,103 @@ out:
 	return ret;
 }
 
+#if defined(CONFIG_MEMCG) && defined(CONFIG_BPF_JIT) && defined(CONFIG_BPF_SYSCALL)
+/********************************************************************************
+ * bpf_struct_ops plumbing.
+ */
+#include <linux/bpf_verifier.h>
+#include <linux/bpf.h>
+#include <linux/btf.h>
+
+/**
+ * struct memcg_charge_ops - Operations for customizing memory cgroup charging
+ *
+ * @get_memcg: function to determine which memory cgroup to charge
+ *
+ * If get_memcg is not NULL (e.g. by BPF), it will be used to find the memcg
+ * to charge for a given folio.
+ */
+struct memcg_charge_ops {
+	struct mem_cgroup *(*get_memcg)(struct folio *folio, struct mm_struct *mm);
+};
+
+static struct memcg_charge_ops memcg_charge_ops;
+static bool mco_initialized;
+
+
+static int bpf_memcg_charge_check_member(const struct btf_type *t,
+					 const struct btf_member *member,
+					 const struct bpf_prog *prog)
+{
+	if (!capable(CAP_BPF) || !capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	if (prog->type != BPF_PROG_TYPE_STRUCT_OPS)
+		return -EINVAL;
+
+	if (!btf_type_is_func_proto(btf_type_by_id(btf_vmlinux, member->type)))
+		return -EINVAL;
+
+	return 0;
+}
+
+static const struct bpf_verifier_ops bpf_memcg_charge_verifier_ops = {
+	.check_member = bpf_memcg_charge_check_member,
+};
+
+static int bpf_memcg_charge_init(struct btf *btf)
+{
+	return 0;
+}
+
+static int bpf_memcg_charge_reg(void *kdata, struct bpf_link *link)
+{
+	struct memcg_charge_ops *mco = kdata;
+
+	WRITE_ONCE(memcg_charge_ops, *mco);
+	WRITE_ONCE(mco_initialized, true);
+	wmb();
+
+	return 0;
+}
+
+static void bpf_memcg_charge_unreg(void *kdata, struct bpf_link *link)
+{
+	WRITE_ONCE(memcg_charge_ops, NULL);
+	WRITE_ONCE(mco_initialized, false);
+	wmb()
+}
+
+struct memcg_charge_ops __memcg_charge_op_stubs = {};
+
+static struct bpf_struct_ops bpf_memcg_charge_ops = {
+	.verifier_ops = &bpf_memcg_charge_verifier_ops,
+	.init = bpf_memcg_charge_init,
+	.reg = bpf_memcg_charge_reg,
+	.unreg = bpf_memcg_charge_unreg,
+	.cfi_stubs = &__memcg_charge_op_stubs,
+	.name = "memcg_charge_ops",
+	.owner = THIS_MODULE,
+};
+
+/**
+ * end bpf_struct_ops plumbing
+ ********************************************************************************/
+#endif // CONFIG_MEMCG && CONFIG_BPF_JIT && CONFIG_BPF_SYSCALL
+
 int __mem_cgroup_charge(struct folio *folio, struct mm_struct *mm, gfp_t gfp)
 {
-	struct mem_cgroup *memcg;
+	struct mem_cgroup *memcg = NULL;
 	int ret;
 
-	memcg = get_mem_cgroup_from_mm(mm);
+#if defined(CONFIG_MEMCG) && defined(CONFIG_BPF_JIT) && defined(CONFIG_BPF_SYSCALL)
+	pr_debug_ratelimited("registered struct ops is %s", mco_initialized ? "true":"false");
+	if (unlikely(READ_ONCE(memcg_charge_ops.get_memcg)))
+		memcg = memcg_charge_ops.get_memcg(folio, mm);
+#endif // CONFIG_MEMCG && CONFIG_BPF_JIT && CONFIG_BPF_SYSCALL
+
+	if (!memcg)
+		memcg = get_mem_cgroup_from_mm(mm);
 	ret = charge_memcg(folio, memcg, gfp);
 	css_put(&memcg->css);
 
@@ -4923,6 +5014,7 @@ __setup("cgroup.memory=", cgroup_memory);
 static int __init mem_cgroup_init(void)
 {
 	int cpu;
+	int ret = 0;
 
 	/*
 	 * Currently s32 type (can refer to struct batched_lruvec_stat) is
@@ -4939,7 +5031,11 @@ static int __init mem_cgroup_init(void)
 		INIT_WORK(&per_cpu_ptr(&memcg_stock, cpu)->work,
 			  drain_local_stock);
 
-	return 0;
+#if defined(CONFIG_MEMCG) && defined(CONFIG_BPF_JIT) && defined(CONFIG_BPF_SYSCALL)
+	ret = register_bpf_struct_ops(&bpf_memcg_charge_ops, memcg_charge_ops);
+#endif // CONFIG_BPF_*
+
+	return ret;
 }
 subsys_initcall(mem_cgroup_init);
 
