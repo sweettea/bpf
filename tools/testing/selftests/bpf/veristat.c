@@ -21,6 +21,7 @@
 #include <gelf.h>
 #include <float.h>
 #include <math.h>
+#include <limits.h>
 
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
@@ -216,7 +217,8 @@ const char argp_program_doc[] =
 "\n"
 "USAGE: veristat <obj-file> [<obj-file>...]\n"
 "   OR: veristat -C <baseline.csv> <comparison.csv>\n"
-"   OR: veristat -R <results.csv>\n";
+"   OR: veristat -R <results.csv>\n"
+"   OR: veristat -vl2 <to_analyze.bpf.o>\n";
 
 enum {
 	OPT_LOG_FIXED = 1000,
@@ -228,7 +230,7 @@ static const struct argp_option opts[] = {
 	{ "version", 'V', NULL, 0, "Print version" },
 	{ "verbose", 'v', NULL, 0, "Verbose mode" },
 	{ "debug", 'd', NULL, 0, "Debug mode (turns on libbpf debug logging)" },
-	{ "log-level", 'l', "LEVEL", 0, "Verifier log level (default 0 for normal mode, 1 for verbose mode)" },
+	{ "log-level", 'l', "LEVEL", 0, "Verifier log level (default 0 for normal mode, 1 for verbose mode, 2 for full verification log)" },
 	{ "log-fixed", OPT_LOG_FIXED, NULL, 0, "Disable verifier log rotation" },
 	{ "log-size", OPT_LOG_SIZE, "BYTES", 0, "Customize verifier log size (default to 16MB)" },
 	{ "top-n", 'n', "N", 0, "Emit only up to first N results." },
@@ -1060,6 +1062,41 @@ static int guess_prog_type_by_ctx_name(const char *ctx_name,
 	return -ESRCH;
 }
 
+/* Make sure only target program is referenced from struct_ops map,
+ * otherwise libbpf would automatically set autocreate for all
+ * referenced programs.
+ * See libbpf.c:bpf_object_adjust_struct_ops_autoload.
+ */
+static void mask_unrelated_struct_ops_progs(struct bpf_object *obj,
+					    struct bpf_map *map,
+					    struct bpf_program *prog)
+{
+	struct btf *btf = bpf_object__btf(obj);
+	const struct btf_type *t, *mt;
+	struct btf_member *m;
+	int i, moff;
+	size_t data_sz, ptr_sz = sizeof(void *);
+	void *data;
+
+	t = btf__type_by_id(btf, bpf_map__btf_value_type_id(map));
+	if (!btf_is_struct(t))
+		return;
+
+	data = bpf_map__initial_value(map, &data_sz);
+	for (i = 0; i < btf_vlen(t); i++) {
+		m = &btf_members(t)[i];
+		mt = btf__type_by_id(btf, m->type);
+		if (!btf_is_ptr(mt))
+			continue;
+		moff = m->offset / 8;
+		if (moff + ptr_sz > data_sz)
+			continue;
+		if (memcmp(data + moff, &prog, ptr_sz) == 0)
+			continue;
+		memset(data + moff, 0, ptr_sz);
+	}
+}
+
 static void fixup_obj(struct bpf_object *obj, struct bpf_program *prog, const char *filename)
 {
 	struct bpf_map *map;
@@ -1074,6 +1111,9 @@ static void fixup_obj(struct bpf_object *obj, struct bpf_program *prog, const ch
 		case BPF_MAP_TYPE_TASK_STORAGE:
 		case BPF_MAP_TYPE_INODE_STORAGE:
 		case BPF_MAP_TYPE_CGROUP_STORAGE:
+			break;
+		case BPF_MAP_TYPE_STRUCT_OPS:
+			mask_unrelated_struct_ops_progs(obj, map, prog);
 			break;
 		default:
 			if (bpf_map__max_entries(map) == 0)
